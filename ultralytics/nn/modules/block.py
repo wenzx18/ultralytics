@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import DeformConv2d
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -2029,3 +2030,115 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+class Conv3d(nn.Module):
+    """
+    Standard convolution module with batch normalization and activation.
+
+    Attributes:
+        conv (nn.Conv3d): Convolutional layer.
+        bn (nn.BatchNorm3d): Batch normalization layer.
+        act (nn.Module): Activation function layer.
+        default_act (nn.Module): Default activation function (SiLU).
+    """
+
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """
+        Initialize Conv layer with given parameters.
+
+        Args:
+            c1 (int): Number of input channels.
+            c2 (int): Number of output channels.
+            k (int): Kernel size.
+            s (int): Stride.
+            p (int, optional): Padding.
+            g (int): Groups.
+            d (int): Dilation.
+            act (bool | nn.Module): Activation function.
+        """
+        super().__init__()
+        self.conv = nn.Conv3d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm3d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x):
+        """
+        Apply convolution, batch normalization and activation to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor.
+        """
+        return self.act(self.bn(self.conv(x)))
+
+
+class DeformConvBlock(nn.Module):
+    """
+    简化版可变形卷积模块 (Wrapper for torchvision DeformConv2d)
+    包含: Offset生成卷积 + DeformConv2d + BN + SiLU
+    """
+    def __init__(self, c1, c2, k=3, s=1, p=1, g=1):
+        super().__init__()
+        self.offset_conv = nn.Conv2d(c1, 2 * k * k, kernel_size=k, stride=s, padding=p)
+        self.dcn = DeformConv2d(c1, c2, kernel_size=k, stride=s, padding=p, groups=g)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        offset = self.offset_conv(x)
+        out = self.dcn(x, offset)
+        return self.act(self.bn(out))
+
+
+class DualStreamStem(nn.Module):
+    """
+    基于 DSFNet 双流机制的 YOLO Stem 层。
+    输入: [B, 3*seq_len, H, W] (通道堆叠格式)
+    输出: [B, c2, H/2, W/2] (与标准 YOLO Stem 输出一致)
+    """
+    def __init__(self, c1, c2, k=3, s=2):
+        super().__init__()
+        
+        # 1. 空间流 (Spatial Stream)
+        # 负责处理当前帧 (3通道)，提取清晰的空间纹理特征
+        # 使用标准 2D 卷积进行下采样
+        self.spatial_stream = Conv(3, c2, k=k, s=s)
+        
+        # 2. 时序流 (Temporal Stream)
+        # 负责处理视频序列 (B, 3, T, H, W)，提取运动特征
+        self.temporal_stream = nn.Sequential(
+            Conv3d(3, c2, k=(1, 1, k), s=(1, 1, s)),
+            Conv3d(c2, c2, k=(1, k, 1), s=(1, s, 1)),
+            Conv3d(c2, c2, k=(k, 1, 1)),
+            nn.AdaptiveMaxPool3d([1, None, None])
+        )
+        
+        self.fusion_dcn = Conv(c2, c2, k=k)
+
+    def forward(self, x):
+        # Input x: [B, 3*seq_len, H, W]
+        B, C_total, H, W = x.shape
+
+        # 1. 数据重塑 (Reshape & Permute)
+        # 将堆叠的通道拆解为序列: [B, 3, seq_len, H, W]
+        x_3d = x.view(B, 3, C_total // 3, H, W)
+        
+        # 2. 双流前向传播 (Dual-Stream Forward)
+        
+        # --- A. 空间流 (Spatial) ---
+        # 提取当前帧 (假设序列最后一帧为当前帧 t)
+        # x_3d[:, :, -1, :, :] 取出最后一个时间步 -> [B, 3, H, W]
+        current_frame = x_3d[:, :, -1, :, :] 
+        feat_spatial = self.spatial_stream(current_frame) # -> [B, c2, H/2, W/2]
+        
+        # --- B. 时序流 (Temporal) ---
+        # 输入整个 3D 序列
+        feat_temporal = self.temporal_stream(x_3d).squeeze(2) # -> [B, c2, 1, H/2, W/2]
+        
+        # 3. 特征融合 (Fusion)
+        return self.fusion_dcn(feat_spatial + feat_temporal)

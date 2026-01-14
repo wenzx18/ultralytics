@@ -85,6 +85,7 @@ class BaseDataset(Dataset):
         classes: list[int] | None = None,
         fraction: float = 1.0,
         channels: int = 3,
+        seq_len: int = 1,
     ):
         """
         Initialize BaseDataset with given configuration and options.
@@ -146,6 +147,7 @@ class BaseDataset(Dataset):
 
         # Transforms
         self.transforms = self.build_transforms(hyp=hyp)
+        self.seq_len = hyp.get('seq_len', seq_len)
 
     def get_img_files(self, img_path: str | list[str]) -> list[str]:
         """
@@ -225,43 +227,81 @@ class BaseDataset(Dataset):
         Raises:
             FileNotFoundError: If the image file is not found.
         """
-        im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
-        if im is None:  # not cached in RAM
-            if fn.exists():  # load npy
-                try:
-                    im = np.load(fn)
-                except Exception as e:
-                    LOGGER.warning(f"{self.prefix}Removing corrupt *.npy image file {fn} due to: {e}")
-                    Path(fn).unlink(missing_ok=True)
+        def _load_one(i):
+            im, f, fn = self.ims[i], self.im_files[i], self.npy_files[i]
+            if im is None:  # not cached in RAM
+                if fn.exists():  # load npy
+                    try:
+                        im = np.load(fn)
+                    except Exception as e:
+                        LOGGER.warning(f"{self.prefix}Removing corrupt *.npy image file {fn} due to: {e}")
+                        Path(fn).unlink(missing_ok=True)
+                        im = imread(f, flags=self.cv2_flag)  # BGR
+                else:  # read image
                     im = imread(f, flags=self.cv2_flag)  # BGR
-            else:  # read image
-                im = imread(f, flags=self.cv2_flag)  # BGR
-            if im is None:
-                raise FileNotFoundError(f"Image Not Found {f}")
+                if im is None:
+                    raise FileNotFoundError(f"Image Not Found {f}")
 
-            h0, w0 = im.shape[:2]  # orig hw
-            if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
-                r = self.imgsz / max(h0, w0)  # ratio
-                if r != 1:  # if sizes are not equal
-                    w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
-                    im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
-            elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
-                im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
-            if im.ndim == 2:
-                im = im[..., None]
+                h0, w0 = im.shape[:2]  # orig hw
+                if rect_mode:  # resize long side to imgsz while maintaining aspect ratio
+                    r = self.imgsz / max(h0, w0)  # ratio
+                    if r != 1:  # if sizes are not equal
+                        w, h = (min(math.ceil(w0 * r), self.imgsz), min(math.ceil(h0 * r), self.imgsz))
+                        im = cv2.resize(im, (w, h), interpolation=cv2.INTER_LINEAR)
+                elif not (h0 == w0 == self.imgsz):  # resize by stretching image to square imgsz
+                    im = cv2.resize(im, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+                if im.ndim == 2:
+                    im = im[..., None]
 
-            # Add to buffer if training with augmentations
-            if self.augment:
-                self.ims[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
-                self.buffer.append(i)
-                if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent empty buffer
-                    j = self.buffer.pop(0)
-                    if self.cache != "ram":
-                        self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
+                # Add to buffer if training with augmentations
+                if self.augment:
+                    self.ims[i], self.im_hw0[i], self.im_hw[i] = im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
+                    self.buffer.append(i)
+                    if 1 < len(self.buffer) >= self.max_buffer_length:  # prevent empty buffer
+                        j = self.buffer.pop(0)
+                        if self.cache != "ram":
+                            self.ims[j], self.im_hw0[j], self.im_hw[j] = None, None, None
 
-            return im, (h0, w0), im.shape[:2]
+                return im, (h0, w0), im.shape[:2]
 
-        return self.ims[i], self.im_hw0[i], self.im_hw[i]
+            return self.ims[i], self.im_hw0[i], self.im_hw[i]
+
+        if self.seq_len == 1:
+            return _load_one(i)
+        
+        # --- 主逻辑：构建时序序列 ---
+        frames = []
+        current_filename = Path(self.im_files[i]).stem  # 获取不带扩展名的文件名
+        try:
+            parts = current_filename.split('-')
+            current_frame_num = int(parts[1])
+
+            # 根据帧数顺序加载前N帧
+            for t in range(self.seq_len - 1, 0, -1):
+                # 计算要查找的帧数（往前找seq_len-1帧，包括当前帧）
+                target_frame_num = current_frame_num - t
+                
+                #TODO 构建目标文件名模式，具体命名可能需要修正
+                target_filename = f"{parts[0]}-{target_frame_num:04d}-{parts[2]}"  # 假设帧数是6位数字，用0补全
+                
+                # 在数据集中搜索匹配的文件
+                prev_idx = self.im_files.index(target_filename)
+                
+                # 加载该帧
+                im_frame, _, _ = _load_one(prev_idx)
+                frames.append(im_frame)
+            # 获取当前帧(序列最后一帧)的元数据返回
+            im_frame, im_hw0, im_hwi = _load_one(i)
+            frames.append(im_frame)
+            # --- 拼接 ---
+            # 在通道维度拼接: (H, W, 3) -> (H, W, 3*seq_len)
+            im_seq = np.concatenate(frames, axis=2)
+        except (ValueError, IndexError):
+            # 如果解析失败，直接重复N次
+            im_frame, im_hw0, im_hwi = _load_one(i)
+            im_seq = np.repeat(im_frame, self.seq_len, axis=2)
+
+        return im_seq, im_hw0, im_hwi
 
     def cache_images(self) -> None:
         """Cache images to memory or disk for faster training."""
